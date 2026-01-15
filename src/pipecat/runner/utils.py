@@ -49,13 +49,19 @@ def _detect_transport_type_from_message(message_data: dict) -> str:
     """Attempt to auto-detect transport type from WebSocket message structure."""
     logger.trace("=== Auto-Detection Analysis ===")
 
-    # Twilio detection
+    # Cloudonix detection (checked first since it has similar structure to Twilio)
     if (
         message_data.get("event") == "start"
         and "start" in message_data
         and "streamSid" in message_data.get("start", {})
         and "callSid" in message_data.get("start", {})
     ):
+        # Cloudonix typically includes session information
+        start_data = message_data.get("start", {})
+        if "session" in start_data:
+            logger.trace("Auto-detected: CLOUDONIX")
+            return "cloudonix"
+        # Fall back to Twilio if no session field
         logger.trace("Auto-detected: TWILIO")
         return "twilio"
 
@@ -133,6 +139,14 @@ async def parse_telephony_websocket(websocket: WebSocket):
                 "account_sid": str,
                 "from": str,
                 "to": str,
+            }
+
+        - Cloudonix::
+
+            {
+                "stream_id": str,
+                "call_id": str,
+                "session_token": str,
             }
 
     Example usage::
@@ -217,6 +231,14 @@ async def parse_telephony_websocket(websocket: WebSocket):
                 "from": start_data.get("from", ""),
                 "to": start_data.get("to", ""),
                 "custom_parameters": start_data.get("custom_parameters", ""),
+            }
+
+        elif transport_type == "cloudonix":
+            start_data = call_data_raw.get("start", {})
+            call_data = {
+                "stream_id": start_data.get("streamSid"),
+                "call_id": start_data.get("callSid"),
+                "session_token": start_data.get("sessionToken"),
             }
 
         else:
@@ -465,10 +487,20 @@ async def _create_telephony_transport(
             stream_sid=call_data["stream_id"],
             call_sid=call_data["call_id"],
         )
+    elif transport_type == "cloudonix":
+        from pipecat.serializers.cloudonix import CloudonixFrameSerializer
+
+        params.serializer = CloudonixFrameSerializer(
+            stream_sid=call_data["stream_id"],
+            call_sid=call_data.get("call_id"),
+            domain_id=os.getenv("CLOUDONIX_DOMAIN_ID", ""),
+            bearer_token=os.getenv("CLOUDONIX_BEARER_TOKEN", ""),
+            session_token=call_data.get("session_token"),
+        )
     else:
         raise ValueError(
             f"Unsupported telephony provider: {transport_type}. "
-            f"Supported providers: twilio, telnyx, plivo, exotel"
+            f"Supported providers: twilio, telnyx, plivo, exotel, cloudonix"
         )
 
     return FastAPIWebsocketTransport(websocket=websocket, params=params)
@@ -485,7 +517,7 @@ async def create_transport(
     Args:
         runner_args: Arguments from the runner.
         transport_params: Dict mapping transport names to parameter factory functions.
-            Keys should be: "daily", "webrtc", "twilio", "telnyx", "plivo", "exotel"
+            Keys should be: "daily", "webrtc", "twilio", "telnyx", "plivo", "exotel", "cloudonix"
             Values should be functions that return transport parameters when called.
 
     Returns:
@@ -527,6 +559,12 @@ async def create_transport(
                 # add_wav_header and serializer will be set automatically
             ),
             "exotel": lambda: FastAPIWebsocketParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                vad_analyzer=SileroVADAnalyzer(),
+                # add_wav_header and serializer will be set automatically
+            ),
+            "cloudonix": lambda: FastAPIWebsocketParams(
                 audio_in_enabled=True,
                 audio_out_enabled=True,
                 vad_analyzer=SileroVADAnalyzer(),
